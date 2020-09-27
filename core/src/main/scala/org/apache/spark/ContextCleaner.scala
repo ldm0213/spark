@@ -236,7 +236,9 @@ private[spark] class ContextCleaner(
     }
   }
 
-  /** Perform broadcast cleanup. */
+  /** Perform broadcast cleanup.
+   * 清理broadcast
+   * */
   def doCleanupBroadcast(broadcastId: Long, blocking: Boolean): Unit = {
     try {
       logDebug(s"Cleaning broadcast $broadcastId")

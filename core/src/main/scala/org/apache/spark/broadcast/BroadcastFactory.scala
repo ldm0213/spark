@@ -26,6 +26,7 @@ import org.apache.spark.SparkConf
  * An interface for all the broadcast implementations in Spark (to allow
  * multiple broadcast implementations). SparkContext uses a BroadcastFactory
  * implementation to instantiate a particular broadcast for the entire Spark job.
+ * 工厂模式的抽象接口，提供初始化,创建以及销毁broadcast
  */
 private[spark] trait BroadcastFactory {
 

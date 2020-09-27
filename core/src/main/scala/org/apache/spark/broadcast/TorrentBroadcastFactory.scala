@@ -25,6 +25,7 @@ import org.apache.spark.{SecurityManager, SparkConf}
  * A [[org.apache.spark.broadcast.Broadcast]] implementation that uses a BitTorrent-like
  * protocol to do a distributed transfer of the broadcasted data to the executors. Refer to
  * [[org.apache.spark.broadcast.TorrentBroadcast]] for more details.
+ * 工厂模式的具体子类，用来创建一个TorrentBroadcast对象
  */
 private[spark] class TorrentBroadcastFactory extends BroadcastFactory {
 

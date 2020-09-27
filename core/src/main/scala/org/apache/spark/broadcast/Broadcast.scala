@@ -50,6 +50,7 @@ import org.apache.spark.util.Utils
  * In addition, the object `v` should not be modified after it is broadcast in order to ensure
  * that all nodes get the same value of the broadcast variable (e.g. if the variable is shipped
  * to a new node later).
+ * broadcast抽象类
  *
  * @param id A unique identifier for the broadcast variable.
  * @tparam T Type of the data contained in the broadcast variable.

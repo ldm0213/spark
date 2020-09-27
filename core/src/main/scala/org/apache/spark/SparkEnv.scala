@@ -314,6 +314,7 @@ object SparkEnv extends Logging {
       }
     }
 
+    // 初始化BroadcastManager
     val broadcastManager = new BroadcastManager(isDriver, conf, securityManager)
 
     val mapOutputTracker = if (isDriver) {

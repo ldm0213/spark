@@ -63,6 +63,7 @@ private[spark] class BroadcastManager(
     )
 
   def newBroadcast[T: ClassTag](value_ : T, isLocal: Boolean): Broadcast[T] = {
+    // 获取一个ID,broadcast的唯一ID
     val bid = nextBroadcastId.getAndIncrement()
     value_ match {
       case pb: PythonBroadcast =>
@@ -74,6 +75,7 @@ private[spark] class BroadcastManager(
 
       case _ => // do nothing
     }
+    // 通过broadcastFactory创建具体的broadcast
     broadcastFactory.newBroadcast[T](value_, isLocal, bid)
   }
 
