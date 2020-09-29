@@ -162,13 +162,14 @@ private[yarn] class YarnAllocator(
   private val allocatorBlacklistTracker =
     new YarnAllocatorBlacklistTracker(sparkConf, amClient, failureTracker)
 
-  // Executor memory in MiB.
+  // Executor memory in MiB.  指定的executor memory
   protected val executorMemory = sparkConf.get(EXECUTOR_MEMORY).toInt
-  // Executor offHeap memory in MiB.
+  // Executor offHeap memory in MiB. off-heap memory
   protected val executorOffHeapMemory = YarnSparkHadoopUtil.executorOffHeapMemorySizeAsMb(sparkConf)
-  // Additional memory overhead.
+  // Additional memory overhead. min(executor * 0.1, 384)
   protected val memoryOverhead: Int = sparkConf.get(EXECUTOR_MEMORY_OVERHEAD).getOrElse(
     math.max((MEMORY_OVERHEAD_FACTOR * executorMemory).toInt, MEMORY_OVERHEAD_MIN)).toInt
+  // pyspark memory
   protected val pysparkWorkerMemory: Int = if (sparkConf.get(IS_PYTHON_APP)) {
     sparkConf.get(PYSPARK_EXECUTOR_MEMORY).map(_.toInt).getOrElse(0)
   } else {

@@ -51,23 +51,33 @@ import org.apache.spark.util.Utils;
  * store a "page number" and the lower 51 bits to store an offset within this page. These page
  * numbers are used to index into a "page table" array inside of the MemoryManager in order to
  * retrieve the base object.
+ * on-heap内存由于JVM GC的影响可能导致对象的地址发生改变，所以用一个数组<页表>来定位数据，
+ * 对于任意一个地址，可以先通过前13bit来定位页，就可以找到数组的相对位置，得到对应的页的MemoryBlock，
+ * 从而找到响应的数据
+ *
  * <p>
  * This allows us to address 8192 pages. In on-heap mode, the maximum page size is limited by the
  * maximum size of a long[] array, allowing us to address 8192 * (2^31 - 1) * 8 bytes, which is
  * approximately 140 terabytes of memory.
+ *
+ * 1. 一个MemoryManger,提供物理内存分配
+ * 2. 一个pageTable,提供逻辑内存展示
+ * 3. 一个consumers,提供给的内存消费者
  */
 public class TaskMemoryManager {
 
   private static final Logger logger = LoggerFactory.getLogger(TaskMemoryManager.class);
 
-  /** The number of bits used to address the page table. */
+  /** The number of bits used to address the page table.
+   *  13位用来表示能存储的最大页数:8092 */
   private static final int PAGE_NUMBER_BITS = 13;
 
-  /** The number of bits used to encode offsets in data pages. */
+  /** The number of bits used to encode offsets in data pages.
+   * 用于保存编码后的偏移量的位数。静态常量OFFSET_BITS的值为51。 */
   @VisibleForTesting
   static final int OFFSET_BITS = 64 - PAGE_NUMBER_BITS;  // 51
 
-  /** The number of entries in the page table. */
+  /** The number of entries in the page table. 8092*/
   private static final int PAGE_TABLE_SIZE = 1 << PAGE_NUMBER_BITS;
 
   /**
@@ -76,10 +86,17 @@ public class TaskMemoryManager {
    * maximum page size is limited by the maximum amount of data that can be stored in a long[]
    * array, which is (2^31 - 1) * 8 bytes (or about 17 gigabytes). Therefore, we cap this at 17
    * gigabytes.
+   *  具体的内存存储是由一个数组存储，数组最大是2^32-1，数组元素是long类型,所以是8字节
+   *    => 所以得到最大的Page大小。静态常量MAXIMUM_PAGE_SIZE_BYTES的值为17179869176，即（2^32-1）× 8。
+   *  java 中数组的最大长度是多少呢？看一下它的length属性就可以了。length属性是32位的有符号整数，它的最大值是2的31次幂，就是2G。为何有这个限制呢？
+   *  为什么length的属性不是long型呢？我们假设一下，如果它是long型的，那么它的最大长度是2的63次幂。内存永远也不会有那么大吧。即使是字节数组长度是int的，最大长都达到2GB.
    */
   public static final long MAXIMUM_PAGE_SIZE_BYTES = ((1L << 31) - 1) * 8L;
 
-  /** Bit mask for the lower 51 bits of a long. */
+  /** Bit mask for the lower 51 bits of a long.
+   * 长整型的低51位的位掩码。静态常量MASK_LONG_LOWER_51_BITS的值为2251799813685247，
+   *    即十六进制0x7FFFFFFFFFFFFL
+   */
   private static final long MASK_LONG_LOWER_51_BITS = 0x7FFFFFFFFFFFFL;
 
   /**
@@ -89,6 +106,7 @@ public class TaskMemoryManager {
    * off-heap addresses. When using an off-heap allocator, every entry in this map will be `null`.
    * When using an on-heap allocator, the entries in this map will point to pages' base objects.
    * Entries are added to this map as new data pages are allocated.
+   * 维护一个Page表。pageTable实际为Page（即MemoryBlock）的数组，数组长度为PAGE_TABLE_SIZE。
    */
   private final MemoryBlock[] pageTable = new MemoryBlock[PAGE_TABLE_SIZE];
 
@@ -97,8 +115,10 @@ public class TaskMemoryManager {
    */
   private final BitSet allocatedPages = new BitSet(PAGE_TABLE_SIZE);
 
+  /** 统一内存管理 **/
   private final MemoryManager memoryManager;
 
+  /** 当前task的唯一标识 **/
   private final long taskAttemptId;
 
   /**
@@ -110,6 +130,7 @@ public class TaskMemoryManager {
 
   /**
    * Tracks spillable memory consumers.
+   * 维护的consumers,消费方从这里拿取内存，可能会涉及到让它们进行spill到磁盘操作
    */
   @GuardedBy("this")
   private final HashSet<MemoryConsumer> consumers;
@@ -132,7 +153,8 @@ public class TaskMemoryManager {
   /**
    * Acquire N bytes of memory for a consumer. If there is no enough memory, it will call
    * spill() of consumers to release more memory.
-   *
+   * 为内存消费者获得指定大小（单位为字节）的内存。
+   * 当Task没有足够的内存时，将调用MemoryConsumer的spill方法释放内存。
    * @return number of bytes successfully granted (<= N).
    */
   public long acquireExecutionMemory(long required, MemoryConsumer consumer) {
@@ -144,17 +166,20 @@ public class TaskMemoryManager {
     // off-heap memory. This is subject to change, though, so it may be risky to make this
     // optimization now in case we forget to undo it late when making changes.
     synchronized (this) {
+      // 获取内存，可能涉及到借用或者收回借用给存储的内存等操作
       long got = memoryManager.acquireExecutionMemory(required, taskAttemptId, mode);
 
       // Try to release memory from other consumers first, then we can reduce the frequency of
       // spilling, avoid to have too many spilled files.
-      if (got < required) {
+      if (got < required) { // 如果不足
         // Call spill() on other consumers to release memory
         // Sort the consumers according their memory usage. So we avoid spilling the same consumer
         // which is just spilled in last few times and re-spilling on it will produce many small
         // spill files.
+        // 内存不足以这次分配，需要获取当前的consumers，看哪个可以释放内存spill到磁盘来腾出空间
         TreeMap<Long, List<MemoryConsumer>> sortedConsumers = new TreeMap<>();
         for (MemoryConsumer c: consumers) {
+          // 前置条件：不能是当前发出申请的消费者，且已使用内存要大于0，同时内存模式与申请的一样
           if (c != consumer && c.getUsed() > 0 && c.getMode() == mode) {
             long key = c.getUsed();
             List<MemoryConsumer> list =
@@ -172,14 +197,15 @@ public class TaskMemoryManager {
             currentEntry = sortedConsumers.lastEntry();
           }
           List<MemoryConsumer> cList = currentEntry.getValue();
-          MemoryConsumer c = cList.get(cList.size() - 1);
+          MemoryConsumer c = cList.get(cList.size() - 1); // 尝试最大的
           try {
-            long released = c.spill(required - got, consumer);
+            long released = c.spill(required - got, consumer); // 尝试溢出到磁盘
             if (released > 0) {
               logger.debug("Task {} released {} from {} for {}", taskAttemptId,
                 Utils.bytesToString(released), c, consumer);
+              // 释放写入到磁盘的大小，再次尝试获取内存
               got += memoryManager.acquireExecutionMemory(required - got, taskAttemptId, mode);
-              if (got >= required) {
+              if (got >= required) { // 够本次申请的大小
                 break;
               }
             } else {
@@ -203,12 +229,17 @@ public class TaskMemoryManager {
       }
 
       // call spill() on itself
+      /**
+       * 走到这里，说明已经对其他MemoryConsumer尝试了溢写操作了，
+       * 如果申请的内存还不够，那么只能让当前申请内存的MemoryConsumer尝试溢写以空闲一部分内存了
+       */
       if (got < required) {
         try {
           long released = consumer.spill(required - got, consumer);
           if (released > 0) {
             logger.debug("Task {} released {} from itself ({})", taskAttemptId,
               Utils.bytesToString(released), consumer);
+            // 做最后的尝试
             got += memoryManager.acquireExecutionMemory(required - got, taskAttemptId, mode);
           }
         } catch (ClosedByInterruptException e) {
@@ -276,25 +307,29 @@ public class TaskMemoryManager {
    *
    * Returns `null` if there was not enough memory to allocate the page. May return a page that
    * contains fewer bytes than requested, so callers should verify the size of returned pages.
-   *
+   * 1. 申请到空闲的Page number号
+   * 2. 进行实际的内存分配，得到一个MemoryBlock
+   * 3. 将Page number 赋给MemoryBlock
    * @throws TooLargePageException
    */
   public MemoryBlock allocatePage(long size, MemoryConsumer consumer) {
     assert(consumer != null);
     assert(consumer.getMode() == tungstenMemoryMode);
-    if (size > MAXIMUM_PAGE_SIZE_BYTES) {
+    if (size > MAXIMUM_PAGE_SIZE_BYTES) { // 不能超过最大页能承受的内存大小
       throw new TooLargePageException(size);
     }
 
+    // 获取执行内存<堆内还是堆外根据consumer的MemoryMode决定>
     long acquired = acquireExecutionMemory(size, consumer);
-    if (acquired <= 0) {
+    if (acquired <= 0) { // 内存不足，无法分配页
       return null;
     }
 
     final int pageNumber;
     synchronized (this) {
+      // 申请到空闲的Page number号
       pageNumber = allocatedPages.nextClearBit(0);
-      if (pageNumber >= PAGE_TABLE_SIZE) {
+      if (pageNumber >= PAGE_TABLE_SIZE) { // 页已经满了，释放内存
         releaseExecutionMemory(acquired, consumer);
         throw new IllegalStateException(
           "Have already allocated a maximum of " + PAGE_TABLE_SIZE + " pages");
@@ -303,6 +338,7 @@ public class TaskMemoryManager {
     }
     MemoryBlock page = null;
     try {
+      // 分配页，构建MemoryBlock
       page = memoryManager.tungstenMemoryAllocator().allocate(acquired);
     } catch (OutOfMemoryError e) {
       logger.warn("Failed to allocate a page ({} bytes), try again.", acquired);
@@ -335,7 +371,7 @@ public class TaskMemoryManager {
             "Called freePage() on a memory block that has already been freed";
     assert(allocatedPages.get(page.pageNumber));
     pageTable[page.pageNumber] = null;
-    synchronized (this) {
+    synchronized (this) { // 清除页号
       allocatedPages.clear(page.pageNumber);
     }
     if (logger.isTraceEnabled()) {
@@ -346,13 +382,14 @@ public class TaskMemoryManager {
     // Doing this allows the MemoryAllocator to detect when a TaskMemoryManager-managed
     // page has been inappropriately directly freed without calling TMM.freePage().
     page.pageNumber = MemoryBlock.FREED_IN_TMM_PAGE_NUMBER;
-    memoryManager.tungstenMemoryAllocator().free(page);
-    releaseExecutionMemory(pageSize, consumer);
+    memoryManager.tungstenMemoryAllocator().free(page); // 释放内存
+    releaseExecutionMemory(pageSize, consumer); // 释放执行内存
   }
 
   /**
    * Given a memory page and offset within that page, encode this address into a 64-bit long.
    * This address will remain valid as long as the corresponding page has not been freed.
+   *  用于根据给定的Page[即MemoryBlock]和Page中偏移量的地址，返回页号和相对于内存块起始地址的偏移量（64位长整型）。
    *
    * @param page a data page allocated by {@link TaskMemoryManager#allocatePage}/
    * @param offsetInPage an offset in this page which incorporates the base offset. In other words,
@@ -365,22 +402,28 @@ public class TaskMemoryManager {
       // In off-heap mode, an offset is an absolute address that may require a full 64 bits to
       // encode. Due to our page size limitation, though, we can convert this into an offset that's
       // relative to the page's base offset; this relative offset will fit in 51 bits.
+      // 此时的参数offsetInPage是操作系统内存的绝对地址，
+      // offsetInPage与MemoryBlock的起始地址之差就是相对于起始地址的偏移量
       offsetInPage -= page.getBaseOffset();
     }
+    // 通过位运算将页号存储到64位长整型的高13位中，并将偏移量存储到64位长整型的低51位中，返回生成的64位的长整型。
     return encodePageNumberAndOffset(page.pageNumber, offsetInPage);
   }
 
+  // 获取页号相对于内存块起始地址的偏移量
   @VisibleForTesting
   public static long encodePageNumberAndOffset(int pageNumber, long offsetInPage) {
     assert (pageNumber >= 0) : "encodePageNumberAndOffset called with invalid page";
     return (((long) pageNumber) << OFFSET_BITS) | (offsetInPage & MASK_LONG_LOWER_51_BITS);
   }
 
+  // 用于解码页号，将64位的长整型右移51位（只剩下页号），然后转换为整型以获得Page的页号。
   @VisibleForTesting
   public static int decodePageNumber(long pagePlusOffsetAddress) {
     return (int) (pagePlusOffsetAddress >>> OFFSET_BITS);
   }
 
+  // 解码偏移量，用于将64位的长整型与51位的掩码按位进行与运算，以获得在Page中的偏移量。
   private static long decodeOffset(long pagePlusOffsetAddress) {
     return (pagePlusOffsetAddress & MASK_LONG_LOWER_51_BITS);
   }
@@ -407,12 +450,14 @@ public class TaskMemoryManager {
    * {@link TaskMemoryManager#encodePageNumberAndOffset(MemoryBlock, long)}
    */
   public long getOffsetInPage(long pagePlusOffsetAddress) {
+    // 获得在Page中的偏移量[前13位是页号，后51是offset]
     final long offsetInPage = decodeOffset(pagePlusOffsetAddress);
-    if (tungstenMemoryMode == MemoryMode.ON_HEAP) {
+    if (tungstenMemoryMode == MemoryMode.ON_HEAP) { // 堆内内存,返回在Page中的偏移量
       return offsetInPage;
     } else {
       // In off-heap mode, an offset is an absolute address. In encodePageNumberAndOffset, we
       // converted the absolute address into a relative address. Here, we invert that operation:
+      // 页号[前13位],通过页号拿取堆外内存的MemoryBlock,通过baseOffset+页内偏移量获取最终地址
       final int pageNumber = decodePageNumber(pagePlusOffsetAddress);
       assert (pageNumber >= 0 && pageNumber < PAGE_TABLE_SIZE);
       final MemoryBlock page = pageTable[pageNumber];

@@ -23,6 +23,7 @@ import org.apache.spark.unsafe.Platform;
 
 /**
  * A consecutive block of memory, starting at a {@link MemoryLocation} with a fixed size.
+ * 继承自MemoryLocation，代表从obj和offset定位的起始位置开始，固定长度（由MemoryBlock的length属性确定）的连续内存块。
  */
 public class MemoryBlock extends MemoryLocation {
 
@@ -45,6 +46,7 @@ public class MemoryBlock extends MemoryLocation {
    */
   public static final int FREED_IN_ALLOCATOR_PAGE_NUMBER = -3;
 
+  // 当前MemoryBlock的连续内存块的长度
   private final long length;
 
   /**
@@ -61,6 +63,7 @@ public class MemoryBlock extends MemoryLocation {
 
   /**
    * Returns the size of the memory block.
+   * MemoryBlock的大小，即length
    */
   public long size() {
     return length;
@@ -68,6 +71,7 @@ public class MemoryBlock extends MemoryLocation {
 
   /**
    * Creates a memory block pointing to the memory used by the long array.
+   * 创建一个指向由长整型数组使用的内存的MemoryBlock
    */
   public static MemoryBlock fromLongArray(final long[] array) {
     return new MemoryBlock(array, Platform.LONG_ARRAY_OFFSET, array.length * 8L);
@@ -75,6 +79,10 @@ public class MemoryBlock extends MemoryLocation {
 
   /**
    * Fills the memory block with the specified byte value.
+   * 以指定的字节填充整个MemoryBlock，
+   * 即将obj对象从offset开始，长度为length的堆内存替换为指定字节的值。
+   * Platform中封装了对sun.misc.Unsafe的API调用，
+   * Platform的setMemory方法实际调用了sun.misc.Unsafe的setMemory<在给定的内存块中设置值>
    */
   public void fill(byte value) {
     Platform.setMemory(obj, offset, length, value);
