@@ -252,10 +252,11 @@ private[spark] class Executor(
     decommissioned = true
   }
 
+  // 启动任务,启动taskRunner进行计算逻辑
   def launchTask(context: ExecutorBackend, taskDescription: TaskDescription): Unit = {
     val tr = new TaskRunner(context, taskDescription)
     runningTasks.put(taskDescription.taskId, tr)
-    threadPool.execute(tr)
+    threadPool.execute(tr) // 线程池
     if (decommissioned) {
       log.error(s"Launching a task while in decommissioned state.")
     }
@@ -591,13 +592,14 @@ private[spark] class Executor(
 
         // directSend = sending directly back to the driver
         val serializedResult: ByteBuffer = {
+          // 任务执行成功
           if (maxResultSize > 0 && resultSize > maxResultSize) {
             logWarning(s"Finished $taskName. Result is larger than maxResultSize " +
               s"(${Utils.bytesToString(resultSize)} > ${Utils.bytesToString(maxResultSize)}), " +
               s"dropping it.")
             ser.serialize(new IndirectTaskResult[Any](TaskResultBlockId(taskId), resultSize))
-          } else if (resultSize > maxDirectResultSize) {
-            val blockId = TaskResultBlockId(taskId)
+          } else if (resultSize > maxDirectResultSize) { // 大于直接获取的大小
+            val blockId = TaskResultBlockId(taskId) // 存储到存储体系中
             env.blockManager.putBytes(
               blockId,
               new ChunkedByteBuffer(serializedDirectResult.duplicate()),
@@ -612,6 +614,7 @@ private[spark] class Executor(
 
         executorSource.SUCCEEDED_TASKS.inc(1L)
         setTaskFinishedAndClearInterruptStatus()
+        // 更新结果
         execBackend.statusUpdate(taskId, TaskState.FINISHED, serializedResult)
       } catch {
         case t: TaskKilledException =>

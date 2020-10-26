@@ -40,21 +40,27 @@ import org.apache.spark.util.io.ChunkedByteBuffer
 
 /**
  * Stores BlockManager blocks on disk.
+ *
+ * 磁盘存储。依赖于DiskBlockManager，负责对Block的磁盘存储，存储数据的抽象为BlockData。
+ * 使用NIO ByteBuffer，MappedByteBuffer，FileChannel等JAVA NIO特性加速文件写入读取
  */
 private[spark] class DiskStore(
     conf: SparkConf,
     diskManager: DiskBlockManager,
-    securityManager: SecurityManager) extends Logging {
+    securityManager: SecurityManager) extends Logging { // SecurityManager用于提供对数据加密的支持
 
+  // 读取磁盘中的Block时，是直接读取还是使用FileChannel的内存镜像映射方法读取的阈值。由spark.storage.memoryMapThreshold配置，默认为2M
   private val minMemoryMapBytes = conf.get(config.STORAGE_MEMORY_MAP_THRESHOLD)
+  // 使用内存映射读取文件的最大阈值，由配置项spark.storage.memoryMapLimitForTests指定。它是个测试参数，默认值为不限制。
   private val maxMemoryMapBytes = conf.get(config.MEMORY_MAP_LIMIT_FOR_TESTS)
+  // 维护块ID与其对应大小之间的映射关系的ConcurrentHashMap。
   private val blockSizes = new ConcurrentHashMap[BlockId, Long]()
 
   def getSize(blockId: BlockId): Long = blockSizes.get(blockId)
 
   /**
    * Invokes the provided callback function to write the specific block.
-   *
+   * 处理memoryStore不能载入的数据或者纯写磁盘的数据
    * @throws IllegalStateException if the block already exists in the disk store.
    */
   def put(blockId: BlockId)(writeFunc: WritableByteChannel => Unit): Unit = {
@@ -63,12 +69,14 @@ private[spark] class DiskStore(
     }
     logDebug(s"Attempting to put block $blockId")
     val startTimeNs = System.nanoTime()
+    // diskManager负责目录规划和文件创建
     val file = diskManager.getFile(blockId)
+    // 利用FileChannel来写入文件，带有count的FileChannel
     val out = new CountingWritableChannel(openForWrite(file))
     var threwException: Boolean = true
     try {
-      writeFunc(out)
-      blockSizes.put(blockId, out.getCount)
+      writeFunc(out) // 参数列表中定义的写入函数，写入到文件中
+      blockSizes.put(blockId, out.getCount) // 记录blockId->大小
       threwException = false
     } finally {
       try {
@@ -89,12 +97,14 @@ private[spark] class DiskStore(
       s" on disk in ${TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startTimeNs)} ms")
   }
 
+  // 用于将BlockId所对应的Block写入磁盘
   def putBytes(blockId: BlockId, bytes: ChunkedByteBuffer): Unit = {
     put(blockId) { channel =>
-      bytes.writeFully(channel)
+      bytes.writeFully(channel) // 使用FileChannel写出到磁盘，channel在put()中会定义，CountingWritableChannel
     }
   }
 
+  // 用于读取给定BlockId所对应的Block，并封装为BlockData返回
   def getBytes(blockId: BlockId): BlockData = {
     getBytes(diskManager.getFile(blockId.name), getSize(blockId))
   }
@@ -103,10 +113,10 @@ private[spark] class DiskStore(
     case Some(key) =>
       // Encrypted blocks cannot be memory mapped; return a special object that does decryption
       // and provides InputStream / FileRegion implementations for reading the data.
-      new EncryptedBlockData(f, blockSize, conf, key)
+      new EncryptedBlockData(f, blockSize, conf, key) // 加密数据
 
     case _ =>
-      new DiskBlockData(minMemoryMapBytes, maxMemoryMapBytes, f, blockSize)
+      new DiskBlockData(minMemoryMapBytes, maxMemoryMapBytes, f, blockSize) // 磁盘数据
   }
 
   def remove(blockId: BlockId): Boolean = {
@@ -139,8 +149,10 @@ private[spark] class DiskStore(
   }
 
   private def openForWrite(file: File): WritableByteChannel = {
+    // 通过文件对象构造了文件输出流FileOutputStream，然后获取它对应的Channel对象用于写数据。
     val out = new FileOutputStream(file).getChannel()
     try {
+      // 如果I/O需要加密，就需要另外调用CryptoStreamUtils.createWritableChannel()方法包装
       securityManager.getIOEncryptionKey().map { key =>
         CryptoStreamUtils.createWritableChannel(out, conf, key)
       }.getOrElse(out)
@@ -169,13 +181,18 @@ private class DiskBlockData(
   */
   override def toNetty(): AnyRef = new DefaultFileRegion(file, 0, size)
 
+  /**
+   * toChunkedByteBuffer()方法会将文件转化为输入流FileInputStream，并获取其ReadableFileChannel，
+   * 再调用JavaUtils.readFully()方法将从Channel中取得的数据填充到ByteBuffer中。
+   * 每个ByteBuffer即为一个Chunk，所有Chunk的数组形成最终的ChunkedByteBuffer。
+   */
   override def toChunkedByteBuffer(allocator: (Int) => ByteBuffer): ChunkedByteBuffer = {
     Utils.tryWithResource(open()) { channel =>
       var remaining = blockSize
       val chunks = new ListBuffer[ByteBuffer]()
-      while (remaining > 0) {
+      while (remaining > 0) { // 不断读取变成ChunkedByteBuffer里面的块
         val chunkSize = math.min(remaining, maxMemoryMapBytes)
-        val chunk = allocator(chunkSize.toInt)
+        val chunk = allocator(chunkSize.toInt) // 可以从堆内或者堆外内存分配执行内存
         remaining -= chunkSize
         JavaUtils.readFully(channel, chunk)
         chunk.flip()
@@ -329,6 +346,7 @@ private class ReadableChannelFileRegion(source: ReadableByteChannel, blockSize: 
   override def deallocate(): Unit = source.close()
 }
 
+/** 带计数器的可写入的FileChannel */
 private class CountingWritableChannel(sink: WritableByteChannel) extends WritableByteChannel {
 
   private var count = 0L

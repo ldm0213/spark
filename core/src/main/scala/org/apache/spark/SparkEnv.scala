@@ -317,6 +317,8 @@ object SparkEnv extends Logging {
     // 初始化BroadcastManager
     val broadcastManager = new BroadcastManager(isDriver, conf, securityManager)
 
+    // 记录ShuffleMapTask的中间数据结果位置供shuffleRead时候使用,Master->Worker架构
+    // Master使用MapOutputTrackerMaster,worker使用MapOutputTrackerWorker
     val mapOutputTracker = if (isDriver) {
       new MapOutputTrackerMaster(conf, broadcastManager, isLocal)
     } else {
@@ -325,11 +327,13 @@ object SparkEnv extends Logging {
 
     // Have to assign trackerEndpoint after initialization as MapOutputTrackerEndpoint
     // requires the MapOutputTracker itself
+    // mapOutputTracker也有endPoint来进行通信，初始化endPoint
     mapOutputTracker.trackerEndpoint = registerOrLookupEndpoint(MapOutputTracker.ENDPOINT_NAME,
       new MapOutputTrackerMasterEndpoint(
         rpcEnv, mapOutputTracker.asInstanceOf[MapOutputTrackerMaster], conf))
 
     // Let the user specify short names for shuffle managers
+    // shuffleManager，统一为SortShuffleManager
     val shortShuffleMgrNames = Map(
       "sort" -> classOf[org.apache.spark.shuffle.sort.SortShuffleManager].getName,
       "tungsten-sort" -> classOf[org.apache.spark.shuffle.sort.SortShuffleManager].getName)
@@ -338,14 +342,17 @@ object SparkEnv extends Logging {
       shortShuffleMgrNames.getOrElse(shuffleMgrName.toLowerCase(Locale.ROOT), shuffleMgrName)
     val shuffleManager = instantiateClass[ShuffleManager](shuffleMgrClass)
 
+    // 统一内存管理: memoryManager
     val memoryManager: MemoryManager = UnifiedMemoryManager(conf, numUsableCores)
 
+    // BlockManager端口
     val blockManagerPort = if (isDriver) {
       conf.get(DRIVER_BLOCK_MANAGER_PORT)
     } else {
       conf.get(BLOCK_MANAGER_PORT)
     }
 
+    // 外部shuffle开启时候使用ExternalBlockStoreClient，否则不指定
     val externalShuffleClient = if (conf.get(config.SHUFFLE_SERVICE_ENABLED)) {
       val transConf = SparkTransportConf.fromSparkConf(conf, "shuffle", numUsableCores)
       Some(new ExternalBlockStoreClient(transConf, securityManager,
@@ -355,11 +362,16 @@ object SparkEnv extends Logging {
     }
 
     // Mapping from block manager id to the block manager's information.
+    // BlockManagerInfo会管理对应的BlockManager的元数据信息，
+    // 他们之间通过心跳连接不断地对信息进行更新，每当有对应的Block被操作的时候，此信息都会发生改变
     val blockManagerInfo = new concurrent.TrieMap[BlockManagerId, BlockManagerInfo]()
+
+    // BlockManagerMaster创建
     val blockManagerMaster = new BlockManagerMaster(
+      // 创建BlockManagerMasterEndpoint
       registerOrLookupEndpoint(
         BlockManagerMaster.DRIVER_ENDPOINT_NAME,
-        new BlockManagerMasterEndpoint(
+        new BlockManagerMasterEndpoint( // MasterEndpoint
           rpcEnv,
           isLocal,
           conf,
@@ -370,17 +382,20 @@ object SparkEnv extends Logging {
             None
           }, blockManagerInfo,
           mapOutputTracker.asInstanceOf[MapOutputTrackerMaster])),
-      registerOrLookupEndpoint(
+      // 创建BlockManagerMasterHeartbeatEndpoint
+      registerOrLookupEndpoint( // heatBeat
         BlockManagerMaster.DRIVER_HEARTBEAT_ENDPOINT_NAME,
         new BlockManagerMasterHeartbeatEndpoint(rpcEnv, isLocal, blockManagerInfo)),
       conf,
       isDriver)
 
+    // 传输服务，基于netty的块传输服务，主要获取块fetchBlocks，复制块uploadBlock
     val blockTransferService =
       new NettyBlockTransferService(conf, securityManager, bindAddress, advertiseAddress,
         blockManagerPort, numUsableCores, blockManagerMaster.driverEndpoint)
 
     // NB: blockManager is not valid until initialize() is called later.
+    // 创建BlockManager
     val blockManager = new BlockManager(
       executorId,
       rpcEnv,

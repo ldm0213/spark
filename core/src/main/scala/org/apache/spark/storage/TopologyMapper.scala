@@ -25,6 +25,7 @@ import org.apache.spark.util.Utils
 /**
  * ::DeveloperApi::
  * TopologyMapper provides topology information for a given host
+ * 拓扑信息:对集群所有节点的拓扑结构的映射
  * @param conf SparkConf to get required properties, if needed
  */
 @DeveloperApi

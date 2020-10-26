@@ -22,6 +22,7 @@ import java.io.{Externalizable, ObjectInput, ObjectOutput}
 import org.apache.spark.rpc.RpcEndpointRef
 import org.apache.spark.util.Utils
 
+/** Slave <-> Master消息 */
 private[spark] object BlockManagerMessages {
   //////////////////////////////////////////////////////////////////////////////////
   // Messages from the master to storage endpoints.

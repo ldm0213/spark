@@ -25,6 +25,7 @@ import org.apache.spark.storage.BlockManagerMessages.{BlockManagerHeartbeat, Sto
 
 /**
  * Separate heartbeat out of BlockManagerMasterEndpoint due to performance consideration.
+ * 心跳管理，可以知道Executor是否还正常运行
  */
 private[spark] class BlockManagerMasterHeartbeatEndpoint(
     override val rpcEnv: RpcEnv,

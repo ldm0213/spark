@@ -183,6 +183,7 @@ private[spark] class CoarseGrainedExecutorBackend(
         val taskDesc = TaskDescription.decode(data.value)
         logInfo("Got assigned task " + taskDesc.taskId)
         taskResources(taskDesc.taskId) = taskDesc.resources
+        // 通过executor启动Task，这里传入了CoarseGrainedExecutorBackend来进行任务结束后的更新状态
         executor.launchTask(this, taskDesc)
       }
 

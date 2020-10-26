@@ -20,6 +20,7 @@ package org.apache.spark.util
 /**
  * Wrapper around an iterator which calls a completion method after it successfully iterates
  * through all the elements.
+ * iterator的包装类，在iterator数据完全遍历完后进行一个回调函数的调用
  */
 private[spark]
 abstract class CompletionIterator[ +A, +I <: Iterator[A]](sub: I) extends Iterator[A] {

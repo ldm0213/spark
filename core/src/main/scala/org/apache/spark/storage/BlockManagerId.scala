@@ -33,6 +33,8 @@ import org.apache.spark.util.Utils
  * can be created only using the apply method in the companion object. This allows de-duplication
  * of ID objects. Also, constructor parameters are private to ensure that parameters cannot be
  * modified from outside this class.
+ *
+ * 标识一个BlockManager唯一性，包含host port 拓扑关系
  */
 @DeveloperApi
 class BlockManagerId private (

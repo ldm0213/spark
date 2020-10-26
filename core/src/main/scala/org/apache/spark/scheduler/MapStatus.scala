@@ -59,7 +59,7 @@ private[spark] object MapStatus {
 
   /**
    * Min partition number to use [[HighlyCompressedMapStatus]]. A bit ugly here because in test
-   * code we can't assume SparkEnv.get exists.
+   * code we can't assume SparkEnv.get exists.  2000
    */
   private lazy val minPartitionsToUseHighlyCompressMapStatus = Option(SparkEnv.get)
     .map(_.conf.get(config.SHUFFLE_MIN_NUM_PARTS_TO_HIGHLY_COMPRESS))
@@ -68,7 +68,7 @@ private[spark] object MapStatus {
   def apply(
       loc: BlockManagerId,
       uncompressedSizes: Array[Long],
-      mapTaskId: Long): MapStatus = {
+      mapTaskId: Long): MapStatus = { // size大于2000用highly压缩的MapStatus
     if (uncompressedSizes.length > minPartitionsToUseHighlyCompressMapStatus) {
       HighlyCompressedMapStatus(loc, uncompressedSizes, mapTaskId)
     } else {

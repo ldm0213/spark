@@ -29,6 +29,9 @@ import org.apache.spark.internal.Logging
  * replicating blocks. BlockManager will replicate to each peer returned in order until the
  * desired replication order is reached. If a replication fails, prioritize() will be called
  * again to get a fresh prioritization.
+ *
+ * 副本策略
+ *
  */
 @DeveloperApi
 trait BlockReplicationPolicy {

@@ -177,7 +177,7 @@ abstract class RDD[T: ClassTag](
     }
     // If this is the first time this RDD is marked for persisting, register it
     // with the SparkContext for cleanups and accounting. Do this only once.
-    if (storageLevel == StorageLevel.NONE) {
+    if (storageLevel == StorageLevel.NONE) { // 没有被persist过
       sc.cleaner.foreach(_.registerRDDForCleanup(this))
       sc.persistRDD(this)
     }
@@ -331,7 +331,7 @@ abstract class RDD[T: ClassTag](
    * subclasses of RDD.
    */
   final def iterator(split: Partition, context: TaskContext): Iterator[T] = {
-    if (storageLevel != StorageLevel.NONE) {
+    if (storageLevel != StorageLevel.NONE) { // 如果persist或者cache或者checkpoint了会改变storageLevel
       getOrCompute(split, context)
     } else {
       computeOrReadCheckpoint(split, context)
@@ -370,7 +370,7 @@ abstract class RDD[T: ClassTag](
     if (isCheckpointedAndMaterialized) {
       firstParent[T].iterator(split, context)
     } else {
-      compute(split, context)
+      compute(split, context) // 调用计算逻辑，不同rdd的计算逻辑不一样
     }
   }
 
@@ -381,27 +381,29 @@ abstract class RDD[T: ClassTag](
     val blockId = RDDBlockId(id, partition.index)
     var readCachedBlock = true
     // This method is called on executors, so we need call SparkEnv.get instead of sc.env.
+    // 通过blockManager进行读取或者计算
     SparkEnv.get.blockManager.getOrElseUpdate(blockId, storageLevel, elementClassTag, () => {
       readCachedBlock = false
+      // 这里说明没有进行cache过，需要计算，产出数据Iterator是通过checkpoint得到
       computeOrReadCheckpoint(partition, context)
     }) match {
       // Block hit.
       case Left(blockResult) =>
-        if (readCachedBlock) {
+        if (readCachedBlock) { // 之前cache过了
           val existingMetrics = context.taskMetrics().inputMetrics
           existingMetrics.incBytesRead(blockResult.bytes)
           new InterruptibleIterator[T](context, blockResult.data.asInstanceOf[Iterator[T]]) {
             override def next(): T = {
-              existingMetrics.incRecordsRead(1)
+              existingMetrics.incRecordsRead(1) // metric读取record记录
               delegate.next()
             }
           }
-        } else {
+        } else { // 没有cache过，通过checkpoint获取得到了数据
           new InterruptibleIterator(context, blockResult.data.asInstanceOf[Iterator[T]])
         }
       // Need to compute the block.
       case Right(iter) =>
-        new InterruptibleIterator(context, iter.asInstanceOf[Iterator[T]])
+        new InterruptibleIterator(context, iter.asInstanceOf[Iterator[T]]) // 只能通过依赖得到，没有cache也没有checkpoint
     }
   }
 

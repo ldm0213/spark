@@ -28,15 +28,21 @@ import org.apache.spark.annotation.DeveloperApi
  * A Block can be uniquely identified by its filename, but each type of Block has a different
  * set of keys which produce its unique name.
  *
+ * 在Spark的存储体系中，数据的读写是以块为单位，只不过这个块并非操作系统的块，而是设计用于Spark存储体系的块Block。
+ * 每个块都有唯一的标识，Spark把这个标识抽象为BlockId。
+ *
  * If your BlockId should be serializable, be sure to add it to the BlockId.apply() method.
  */
 @DeveloperApi
 sealed abstract class BlockId {
   /** A globally unique identifier for this Block. Can be used for ser/de. */
+  // 唯一名字,由后续子类进行实现,各种Block有不同的命名规范
   def name: String
 
   // convenience methods
   def asRDDId: Option[RDDBlockId] = if (isRDD) Some(asInstanceOf[RDDBlockId]) else None
+
+  /** 判断是否属于RDD,Shuffle,Broadcast */
   def isRDD: Boolean = isInstanceOf[RDDBlockId]
   def isShuffle: Boolean = {
     (isInstanceOf[ShuffleBlockId] || isInstanceOf[ShuffleBlockBatchId] ||
@@ -117,6 +123,7 @@ class UnrecognizedBlockId(name: String)
 
 @DeveloperApi
 object BlockId {
+  // 正则
   val RDD = "rdd_([0-9]+)_([0-9]+)".r
   val SHUFFLE = "shuffle_([0-9]+)_([0-9]+)_([0-9]+)".r
   val SHUFFLE_BATCH = "shuffle_([0-9]+)_([0-9]+)_([0-9]+)_([0-9]+)".r
@@ -129,6 +136,7 @@ object BlockId {
   val TEMP_SHUFFLE = "temp_shuffle_([-A-Fa-f0-9]+)".r
   val TEST = "test_(.*)".r
 
+  // 根据名字进行正则解析得到相应的BlockId
   def apply(name: String): BlockId = name match {
     case RDD(rddId, splitIndex) =>
       RDDBlockId(rddId.toInt, splitIndex.toInt)

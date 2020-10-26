@@ -28,6 +28,15 @@ import org.apache.spark.util.{ThreadUtils, Utils}
 /**
  * An RpcEndpoint to take commands from the master to execute options. For example,
  * this is used to remove blocks from the storage endpoint's BlockManager.
+ *
+ * 每个Executor或Driver的SparkEnv中都有属于自己的BlockManagerStorageEndpoint
+ * 分别由各自的BlockManager负责创建和注册到各自的RpcEnv中。
+ * Driver或Executor都存在各自的BlockManagerStorageEndpoint，
+ * 并由各自BlockManager的slaveEndpoint属性持有各自BlockManagerStorageEndpoint的RpcEndpointRef。
+ * BlockManagerStorageEndpoint将接收BlockManagerMasterEndpoint下发的命令。
+ * 例如，删除Block、获取Block状态、获取匹配的BlockId等。
+ *
+ * BlockManagerStorageEndpoint用于接收BlockManagerMasterEndpoint的命令并执行相应的操作。
  */
 private[storage]
 class BlockManagerStorageEndpoint(
@@ -36,11 +45,15 @@ class BlockManagerStorageEndpoint(
     mapOutputTracker: MapOutputTracker)
   extends IsolatedRpcEndpoint with Logging {
 
+  // scala中Future+ExecutionContext可以简化线程池使用，不用提交
+  // future会隐式将执行的job传给线程池，然后运行，等到计算结果
   private val asyncThreadPool =
     ThreadUtils.newDaemonCachedThreadPool("block-manager-storage-async-thread-pool", 100)
+  // implicit后面Future中就不需要添加这个参数了
   private implicit val asyncExecutionContext = ExecutionContext.fromExecutorService(asyncThreadPool)
 
   // Operations that involve removing blocks may be slow and should be done asynchronously
+  // 具体的删除操作，通过executor端的blockManager进行各种操作
   override def receiveAndReply(context: RpcCallContext): PartialFunction[Any, Unit] = {
     case RemoveBlock(blockId) =>
       doAsync[Boolean]("removing block " + blockId, context) {
@@ -56,7 +69,7 @@ class BlockManagerStorageEndpoint(
     case RemoveShuffle(shuffleId) =>
       doAsync[Boolean]("removing shuffle " + shuffleId, context) {
         if (mapOutputTracker != null) {
-          mapOutputTracker.unregisterShuffle(shuffleId)
+          mapOutputTracker.unregisterShuffle(shuffleId) // 更新信息
         }
         SparkEnv.get.shuffleManager.unregisterShuffle(shuffleId)
       }

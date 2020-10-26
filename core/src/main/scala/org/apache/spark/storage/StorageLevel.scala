@@ -41,25 +41,31 @@ class StorageLevel private(
     private var _useMemory: Boolean,
     private var _useOffHeap: Boolean,
     private var _deserialized: Boolean,
-    private var _replication: Int = 1)
-  extends Externalizable {
+    private var _replication: Int = 1)  extends Externalizable {
 
   // TODO: Also add fields for caching priority, dataset ID, and flushing.
   private def this(flags: Int, replication: Int) {
     this((flags & 8) != 0, (flags & 4) != 0, (flags & 2) != 0, (flags & 1) != 0, replication)
   }
 
-  def this() = this(false, true, false, false)  // For deserialization
+  def this() = this(false, true, false, false)
 
+  // 能否写入磁盘。当Block的StorageLevel中的_useDisk为true时，存储体系将允许Block写入磁盘。
   def useDisk: Boolean = _useDisk
+  // 能否写入堆内存。当Block的StorageLevel中的_useMemory为true时，存储体系将允许Block写入堆内存。
   def useMemory: Boolean = _useMemory
+  // 能否写入堆外内存。当Block的StorageLevel中的_useOffHeap为true时，存储体系将允许Block写入堆外内存。
   def useOffHeap: Boolean = _useOffHeap
+  // 表示数据是否已被反序列化。当Block本身经过了序列化后，Block的StorageLevel中的_deserialized将被设置为false，即表示在使用数据时需要对Block进行反序列化。
   def deserialized: Boolean = _deserialized
+
+  //  Block的复制份数。Block的StorageLevel中的_replication默认等于1，可以在构造Block的StorageLevel时明确指定_replication的数量。
+  //  当_replication大于1时，Block除了在本地的存储体系中写入一份，还会复制到其他不同节点的存储体系中写入，达到复制备份的目的。
   def replication: Int = _replication
 
   assert(replication < 40, "Replication restricted to be less than 40 for calculating hash codes")
 
-  if (useOffHeap) {
+  if (useOffHeap) { // 使用堆外内存时候必须不能支持反序列化存储数据
     require(!deserialized, "Off-heap storage level does not support deserialized storage")
   }
 
@@ -102,11 +108,17 @@ class StorageLevel private(
     ret
   }
 
+  /**
+   * 将StorageLevel首先通过toInt方法将_useDisk、_useMemory、_useOffHeap、_deserialized四个属性
+   * 设置到四位数的状态位，
+   * 然后与_replication一起被序列化写入外部二进制流。
+   */
   override def writeExternal(out: ObjectOutput): Unit = Utils.tryOrIOException {
     out.writeByte(toInt)
     out.writeByte(_replication)
   }
 
+  // 从外部二进制流中读取StorageLevel的各个属性。
   override def readExternal(in: ObjectInput): Unit = Utils.tryOrIOException {
     val flags = in.readByte()
     _useDisk = (flags & 8) != 0
@@ -150,6 +162,7 @@ class StorageLevel private(
  * new storage levels.
  */
 object StorageLevel {
+  // 预定义的几种存储级别
   val NONE = new StorageLevel(false, false, false, false)
   val DISK_ONLY = new StorageLevel(true, false, false, false)
   val DISK_ONLY_2 = new StorageLevel(true, false, false, false, 2)
@@ -167,6 +180,7 @@ object StorageLevel {
   /**
    * :: DeveloperApi ::
    * Return the StorageLevel object with the specified name.
+   * 从指定的字符串得到对应的存储级别
    */
   @DeveloperApi
   def fromString(s: String): StorageLevel = s match {

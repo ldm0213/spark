@@ -100,10 +100,13 @@ class ShuffledRDD[K: ClassTag, V: ClassTag, C: ClassTag](
   }
 
   override def compute(split: Partition, context: TaskContext): Iterator[(K, C)] = {
+    // 获取第一个依赖
     val dep = dependencies.head.asInstanceOf[ShuffleDependency[K, V, C]]
     val metrics = context.taskMetrics().createTempShuffleReadMetrics()
+    // 首先调用SortShuffleManager的getReader()方法获取BlockStoreShuffleReader
     SparkEnv.get.shuffleManager.getReader(
       dep.shuffleHandle, split.index, split.index + 1, context, metrics)
+      // 调用BlockStoreShuffleReader的read()方法获取map任务输出的Block并在reduce端进行聚合或排序
       .read()
       .asInstanceOf[Iterator[(K, C)]]
   }

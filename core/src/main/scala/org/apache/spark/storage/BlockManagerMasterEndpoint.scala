@@ -42,6 +42,14 @@ import org.apache.spark.util.{RpcUtils, ThreadUtils, Utils}
 /**
  * BlockManagerMasterEndpoint is an [[IsolatedRpcEndpoint]] on the master node to track statuses
  * of all the storage endpoints' block managers.
+ *
+ * BlockManagerMasterEndpoint由Driver上的SparkEnv负责创建和注册到Driver的RpcEnv中。
+ * BlockManagerMasterEndpoint只存在于Driver的SparkEnv中，
+ * Driver或Executor上的BlockManagerMaster有driverEndpoint属性，将持有BlockManagerMasterEndpoint的RpcEndpointRef。
+ *
+ * BlockManagerMasterEndpoint接收Driver或Executor上BlockManagerMaster发送的消息，对所有的BlockManager统一管理
+ * 主要对各个节点上的BlockManager、BlockManager与Executor的映射关系，及Block位置信息（即Block所在的BlockManager）等进行管理。
+ *
  */
 private[spark]
 class BlockManagerMasterEndpoint(
@@ -50,34 +58,42 @@ class BlockManagerMasterEndpoint(
     conf: SparkConf,
     listenerBus: LiveListenerBus,
     externalBlockStoreClient: Option[ExternalBlockStoreClient],
+    //  BlockManagerInfo会管理对应的BlockManager的元数据信息，他们之间通过心跳连接不断地对信息进行更新，每当有对应的Block被操作的时候，此信息都会发生改变
     blockManagerInfo: mutable.Map[BlockManagerId, BlockManagerInfo],
     mapOutputTracker: MapOutputTrackerMaster)
   extends IsolatedRpcEndpoint with Logging {
 
   // Mapping from executor id to the block manager's local disk directories.
+  // 存储executor标识 -> executor存储磁盘文件的一级目录缓存
   private val executorIdToLocalDirs =
     CacheBuilder
       .newBuilder()
-      .maximumSize(conf.get(config.STORAGE_LOCAL_DISK_BY_EXECUTORS_CACHE_SIZE))
+      .maximumSize(conf.get(config.STORAGE_LOCAL_DISK_BY_EXECUTORS_CACHE_SIZE)) // 默认最大1000
       .build[String, Array[String]]()
 
   // Mapping from external shuffle service block manager id to the block statuses.
+  // 每个BlockManager上面的Block的状态信息
   private val blockStatusByShuffleService =
     new mutable.HashMap[BlockManagerId, JHashMap[BlockId, BlockStatus]]
 
   // Mapping from executor ID to block manager ID.
+  /** executor-id到BlockManagerId的HashMap，可以通过executor-id找到BlockManagerId的信息 */
   private val blockManagerIdByExecutor = new mutable.HashMap[String, BlockManagerId]
 
   // Set of block managers which are decommissioning
+  // 下线的BlockManager
   private val decommissioningBlockManagerSet = new mutable.HashSet[BlockManagerId]
 
   // Mapping from block id to the set of block managers that have the block.
+  /** 同一个数据块可能被多个BlockManager管理，通过一个BlockId找到一个BlockManagerId集合 */
   private val blockLocations = new JHashMap[BlockId, mutable.HashSet[BlockManagerId]]
 
+  /** 创建一个线程池，用来处理各个slave的BlockManger发送过来的信息 */
   private val askThreadPool =
     ThreadUtils.newDaemonCachedThreadPool("block-manager-ask-thread-pool", 100)
   private implicit val askExecutionContext = ExecutionContext.fromExecutorService(askThreadPool)
 
+  /** 对集群所有节点的拓扑结构的映射 */
   private val topologyMapper = {
     val topologyMapperClassName = conf.get(
       config.STORAGE_REPLICATION_TOPOLOGY_MAPPER)
@@ -90,23 +106,29 @@ class BlockManagerMasterEndpoint(
 
   val proactivelyReplicate = conf.get(config.STORAGE_REPLICATION_PROACTIVE)
 
+  // rpc超时时间
   val defaultRpcTimeout = RpcUtils.askRpcTimeout(conf)
 
   logInfo("BlockManagerMasterEndpoint up")
   // same as `conf.get(config.SHUFFLE_SERVICE_ENABLED)
   //   && conf.get(config.SHUFFLE_SERVICE_FETCH_RDD_ENABLED)`
+  // 是否开启了外部shuffle服务以及外部shuffle的port
   private val externalShuffleServiceRddFetchEnabled: Boolean = externalBlockStoreClient.isDefined
   private val externalShuffleServicePort: Int = StorageUtils.externalShuffleServicePort(conf)
 
+  // driver的RpcEnv
   private lazy val driverEndpoint =
     RpcUtils.makeDriverRef(CoarseGrainedSchedulerBackend.ENDPOINT_NAME, conf, rpcEnv)
 
+  /** 接收和处理消息 */
   override def receiveAndReply(context: RpcCallContext): PartialFunction[Any, Unit] = {
+    /** executor启动时候会注册BlockManager：需要executor端的id,一级目录,堆内最大存储内存,堆外最大存储内存,executor端的slaveEndpoint Ref */
     case RegisterBlockManager(id, localDirs, maxOnHeapMemSize, maxOffHeapMemSize, endpoint) =>
       context.reply(register(id, localDirs, maxOnHeapMemSize, maxOffHeapMemSize, endpoint))
 
+    /** 更新BlockInfo信息，主要委托给BlockManagerInfo来对元数据的管理更新删除操作，同时更新块对应的位置信息 */
     case _updateBlockInfo @
-        UpdateBlockInfo(blockManagerId, blockId, storageLevel, deserializedSize, size) =>
+        UpdateBlockInfo(blockManagerId, blockId, storageLevel, deserializedSize, size) => // 更新块信息
       val isSuccess = updateBlockInfo(blockManagerId, blockId, storageLevel, deserializedSize, size)
       context.reply(isSuccess)
       // SPARK-30594: we should not post `SparkListenerBlockUpdated` when updateBlockInfo
@@ -115,12 +137,15 @@ class BlockManagerMasterEndpoint(
         listenerBus.post(SparkListenerBlockUpdated(BlockUpdatedInfo(_updateBlockInfo)))
       }
 
+    /** 获取blockId在的位置，MasterEndpoint维护了blockId的位置信息 */
     case GetLocations(blockId) =>
       context.reply(getLocations(blockId))
 
+    /** 获取blockId在的位置和状态，如果开启了外部shuffle服务，可能还会考虑就近拿取数据即使executor挂掉了 */
     case GetLocationsAndStatus(blockId, requesterHost) =>
       context.reply(getLocationsAndStatus(blockId, requesterHost))
 
+    /** 获取blockIds在的位置 */
     case GetLocationsMultipleBlockIds(blockIds) =>
       context.reply(getLocationsMultipleBlockIds(blockIds))
 
@@ -139,12 +164,14 @@ class BlockManagerMasterEndpoint(
     case GetBlockStatus(blockId, askStorageEndpoints) =>
       context.reply(blockStatus(blockId, askStorageEndpoints))
 
+    /** exector是否还存活 */
     case IsExecutorAlive(executorId) =>
       context.reply(blockManagerIdByExecutor.contains(executorId))
 
     case GetMatchingBlockIds(filter, askStorageEndpoints) =>
       context.reply(getMatchingBlockIds(filter, askStorageEndpoints))
 
+    /** 删除rdd，shuffle， broadcast，blockID以及exector */
     case RemoveRdd(rddId) =>
       context.reply(removeRdd(rddId))
 
@@ -198,9 +225,9 @@ class BlockManagerMasterEndpoint(
         s" from block manager $bmId", e)
       defaultValue
 
-    case t: TimeoutException =>
+    case t: TimeoutException => // 超时通过心跳连接获取到
       val executorId = bmId.executorId
-      val isAlive = try {
+      val isAlive = try { // 再次确认
         driverEndpoint.askSync[Boolean](CoarseGrainedClusterMessages.IsExecutorAlive(executorId))
       } catch {
         // ignore the non-fatal error from driverEndpoint since the caller doesn't really
@@ -219,6 +246,7 @@ class BlockManagerMasterEndpoint(
       }
   }
 
+  /** 将rddId的文件删除 */
   private def removeRdd(rddId: Int): Future[Seq[Int]] = {
     // First remove the metadata for the given RDD, and then asynchronously remove the blocks
     // from the storage endpoints.
@@ -229,15 +257,19 @@ class BlockManagerMasterEndpoint(
     // Find all blocks for the given RDD, remove the block from both blockLocations and
     // the blockManagerInfo that is tracking the blocks and create the futures which asynchronously
     // remove the blocks from storage endpoints and gives back the number of removed blocks
+    // 查找哪些BlockInfo持有改block,由于副本的存在可能导致一个block有多个存储位置
     val blocks = blockLocations.asScala.keys.flatMap(_.asRDDId).filter(_.rddId == rddId)
     val blocksToDeleteByShuffleService =
       new mutable.HashMap[BlockManagerId, mutable.HashSet[RDDBlockId]]
 
+    // 先删除元信息
     blocks.foreach { blockId =>
       val bms: mutable.HashSet[BlockManagerId] = blockLocations.remove(blockId)
 
+      // 区分开启了外部shuffle的executor和不开启外部shuffle的executor
       val (bmIdsExtShuffle, bmIdsExecutor) = bms.partition(_.port == externalShuffleServicePort)
       val liveExecutorsForBlock = bmIdsExecutor.map(_.executorId).toSet
+      // 开启外部shuffle的executor，删除blockStatusByShuffleService中的信息
       bmIdsExtShuffle.foreach { bmIdForShuffleService =>
         // if the original executor is already released then delete this disk block via
         // the external shuffle service
@@ -250,12 +282,15 @@ class BlockManagerMasterEndpoint(
           }
         }
       }
+
+      // 没有开启外部shuffle的通过blockManagerInfo删除
       bmIdsExecutor.foreach { bmId =>
         blockManagerInfo.get(bmId).foreach { bmInfo =>
           bmInfo.removeBlock(blockId)
         }
       }
     }
+    // 发送消息让executor删除
     val removeRddFromExecutorsFutures = blockManagerInfo.values.map { bmInfo =>
       bmInfo.storageEndpoint.ask[Int](removeMsg).recover {
         // use 0 as default value means no blocks were removed
@@ -263,9 +298,10 @@ class BlockManagerMasterEndpoint(
       }
     }.toSeq
 
+    // 通过外部shuffle服务删除
     val removeRddBlockViaExtShuffleServiceFutures = externalBlockStoreClient.map { shuffleClient =>
       blocksToDeleteByShuffleService.map { case (bmId, blockIds) =>
-        Future[Int] {
+        Future[Int] { // 通过shuffleClient调用删除block信息
           val numRemovedBlocks = shuffleClient.removeBlocks(
             bmId.host,
             bmId.port,
@@ -278,11 +314,14 @@ class BlockManagerMasterEndpoint(
 
     Future.sequence(removeRddFromExecutorsFutures ++ removeRddBlockViaExtShuffleServiceFutures)
   }
+
+  /** 将shuffle过程中产生的文件删除 */
   private def removeShuffle(shuffleId: Int): Future[Seq[Boolean]] = {
     // Nothing to do in the BlockManagerMasterEndpoint data structures
     val removeMsg = RemoveShuffle(shuffleId)
     Future.sequence(
       blockManagerInfo.values.map { bm =>
+        // 给Executor发消息，让其删除块
         bm.storageEndpoint.ask[Boolean](removeMsg).recover {
           // use false as default value means no shuffle data were removed
           handleBlockRemovalFailure("shuffle", shuffleId.toString, bm.blockManagerId, false)
@@ -322,7 +361,7 @@ class BlockManagerMasterEndpoint(
     blockManagerInfo.remove(blockManagerId)
 
     val iterator = info.blocks.keySet.iterator
-    while (iterator.hasNext) {
+    while (iterator.hasNext) { // 删除他持有的块信息
       val blockId = iterator.next
       val locations = blockLocations.get(blockId)
       locations -= blockManagerId
@@ -354,6 +393,7 @@ class BlockManagerMasterEndpoint(
 
   }
 
+  // 删除executor主要是删除他持有的blockManagerInfo
   private def removeExecutor(execId: String): Unit = {
     logInfo("Trying to remove executor " + execId + " from BlockManagerMaster.")
     blockManagerIdByExecutor.get(execId).foreach(removeBlockManager)
@@ -487,26 +527,29 @@ class BlockManagerMasterEndpoint(
 
   /**
    * Returns the BlockManagerId with topology information populated, if available.
+   * 注册executor的BlockManager端的Master来统一管理
    */
   private def register(
-      idWithoutTopologyInfo: BlockManagerId,
+      idWithoutTopologyInfo: BlockManagerId, // 注册时候还没有topology信息，需要Master来分配填充
       localDirs: Array[String],
       maxOnHeapMemSize: Long,
       maxOffHeapMemSize: Long,
       storageEndpoint: RpcEndpointRef): BlockManagerId = {
     // the dummy id is not expected to contain the topology information.
     // we get that info here and respond back with a more fleshed out block manager id
+    // 补充拓扑信息，并添加到blockManagerInfo中
     val id = BlockManagerId(
       idWithoutTopologyInfo.executorId,
       idWithoutTopologyInfo.host,
       idWithoutTopologyInfo.port,
-      topologyMapper.getTopologyForHost(idWithoutTopologyInfo.host))
+      topologyMapper.getTopologyForHost(idWithoutTopologyInfo.host)) // 主要是使用topologyMapper生产拓扑信息
 
     val time = System.currentTimeMillis()
     executorIdToLocalDirs.put(id.executorId, localDirs)
-    if (!blockManagerInfo.contains(id)) {
+    if (!blockManagerInfo.contains(id)) { // 当前并未管理该BlockManagerId的BlockManagerInfo对象
+      // 根据BlockManagerId中保存的Executor ID获取旧的BlockManagerId
       blockManagerIdByExecutor.get(id.executorId) match {
-        case Some(oldId) =>
+        case Some(oldId) => // 存在，则移除
           // A block manager of the same executor already exists, so remove it (assumed dead)
           logError("Got two different block manager registrations on same executor - "
               + s" will replace old one $oldId with new one $id")
@@ -516,8 +559,10 @@ class BlockManagerMasterEndpoint(
       logInfo("Registering block manager %s with %s RAM, %s".format(
         id.hostPort, Utils.bytesToString(maxOnHeapMemSize + maxOffHeapMemSize), id))
 
+      // 更新blockManagerIdByExecutor字典
       blockManagerIdByExecutor(id.executorId) = id
 
+      // 外部shuffle服务
       val externalShuffleServiceBlockStatus =
         if (externalShuffleServiceRddFetchEnabled) {
           val externalShuffleServiceBlocks = blockStatusByShuffleService
@@ -526,32 +571,34 @@ class BlockManagerMasterEndpoint(
         } else {
           None
         }
-
+      // 更新blockManagerInfo字典，添加新的BlockManagerInfo对象
       blockManagerInfo(id) = new BlockManagerInfo(id, System.currentTimeMillis(),
         maxOnHeapMemSize, maxOffHeapMemSize, storageEndpoint, externalShuffleServiceBlockStatus)
     }
+    // 触发对所有SparkListener的onBlockManagerAdded方法的调用，进而达到监控的目的。
     listenerBus.post(SparkListenerBlockManagerAdded(time, id, maxOnHeapMemSize + maxOffHeapMemSize,
         Some(maxOnHeapMemSize), Some(maxOffHeapMemSize)))
     id
   }
 
+  // 更新状态，同时更新location信息
   private def updateBlockInfo(
       blockManagerId: BlockManagerId,
-      blockId: BlockId,
-      storageLevel: StorageLevel,
-      memSize: Long,
-      diskSize: Long): Boolean = {
+      blockId: BlockId, // 块标识
+      storageLevel: StorageLevel, // 存储级别
+      memSize: Long, // 使用的内存大小
+      diskSize: Long): Boolean = { // 使用的磁盘大小
     logDebug(s"Updating block info on master ${blockId} for ${blockManagerId}")
 
-    if (blockId.isShuffle) {
+    if (blockId.isShuffle) { // shuffle中间文件是由MapOutputTracker记录的，所以不需要做什么处理
       blockId match {
-        case ShuffleIndexBlockId(shuffleId, mapId, _) =>
+        case ShuffleIndexBlockId(shuffleId, mapId, _) => // shuffle index文件
           // Don't update the map output on just the index block
           logDebug(s"Received shuffle index block update for ${shuffleId} ${mapId}, ignoring.")
           return true
-        case ShuffleDataBlockId(shuffleId: Int, mapId: Long, reduceId: Int) =>
+        case ShuffleDataBlockId(shuffleId: Int, mapId: Long, reduceId: Int) => // Shuffle数据文件
           logDebug(s"Received shuffle data block update for ${shuffleId} ${mapId}, updating.")
-          mapOutputTracker.updateMapOutput(shuffleId, mapId, blockManagerId)
+          mapOutputTracker.updateMapOutput(shuffleId, mapId, blockManagerId) // 更新mapOutputTracker
           return true
         case _ =>
           logDebug(s"Unexpected shuffle block type ${blockId}" +
@@ -560,7 +607,7 @@ class BlockManagerMasterEndpoint(
       }
     }
 
-    if (!blockManagerInfo.contains(blockManagerId)) {
+    if (!blockManagerInfo.contains(blockManagerId)) { // 判断是否存在对应的BlockManager
       if (blockManagerId.isDriver && !isLocal) {
         // We intentionally do not register the master (except in local mode),
         // so we should not indicate failure.
@@ -570,13 +617,15 @@ class BlockManagerMasterEndpoint(
       }
     }
 
-    if (blockId == null) {
+    if (blockId == null) {  // 如果指定的数据块的BlockId为空，仅仅更新BlockManagerInfo中记录的最后更新时间
       blockManagerInfo(blockManagerId).updateLastSeenMs()
       return true
     }
 
+    // blockManagerInfo来更新Block的状态信息
     blockManagerInfo(blockManagerId).updateBlockInfo(blockId, storageLevel, memSize, diskSize)
 
+    // 同一个数据块可能被多个BlockManager管理，通过一个BlockId找到一个BlockManagerId集合
     var locations: mutable.HashSet[BlockManagerId] = null
     if (blockLocations.containsKey(blockId)) {
       locations = blockLocations.get(blockId)
@@ -585,6 +634,7 @@ class BlockManagerMasterEndpoint(
       blockLocations.put(blockId, locations)
     }
 
+    // 存储级别有效，需要将BlockManagerId添加到数据块的位置信息中
     if (storageLevel.isValid) {
       locations.add(blockManagerId)
     } else {
@@ -607,10 +657,12 @@ class BlockManagerMasterEndpoint(
     true
   }
 
+  // 获取位置信息
   private def getLocations(blockId: BlockId): Seq[BlockManagerId] = {
     if (blockLocations.containsKey(blockId)) blockLocations.get(blockId).toSeq else Seq.empty
   }
 
+  /** 获取Block的位置信息以及状态信息 */
   private def getLocationsAndStatus(
       blockId: BlockId,
       requesterHost: String): Option[BlockLocationsAndStatus] = {
@@ -650,6 +702,7 @@ class BlockManagerMasterEndpoint(
   private def getPeers(blockManagerId: BlockManagerId): Seq[BlockManagerId] = {
     val blockManagerIds = blockManagerInfo.keySet
     if (blockManagerIds.contains(blockManagerId)) {
+      // 将传入的BlockManagerId过滤掉
       blockManagerIds
         .filterNot { _.isDriver }
         .filterNot { _ == blockManagerId }
@@ -687,12 +740,14 @@ object BlockStatus {
   def empty: BlockStatus = BlockStatus(StorageLevel.NONE, memSize = 0L, diskSize = 0L)
 }
 
+/**  BlockManagerInfo会管理对应的BlockManager的元数据信息，块信息，堆内，堆外内存等
+ *   Driver与Executor不断通信进行更新，每当有对应的Block被操作的时候，此信息都会发生改变 */
 private[spark] class BlockManagerInfo(
     val blockManagerId: BlockManagerId,
     timeMs: Long,
     val maxOnHeapMem: Long,
     val maxOffHeapMem: Long,
-    val storageEndpoint: RpcEndpointRef,
+    val storageEndpoint: RpcEndpointRef, // slave节点的RpcEndPoint
     val externalShuffleServiceBlockStatus: Option[JHashMap[BlockId, BlockStatus]])
   extends Logging {
 
@@ -700,18 +755,23 @@ private[spark] class BlockManagerInfo(
 
   val externalShuffleServiceEnabled = externalShuffleServiceBlockStatus.isDefined
 
+  // 记录最后一次访问当前BlockManagerInfo的时间
   private var _lastSeenMs: Long = timeMs
+  // 记录当前BlockManagerInfo对应的BlockManager管理的所有数据块的剩余的可用内存大小
   private var _remainingMem: Long = maxMem
 
   // Mapping from block id to its status.
+  // 记录当前BlockManagerInfo对应的BlockManager管理的所有数据块的BlockStatus状态对象
   private val _blocks = new JHashMap[BlockId, BlockStatus]
 
+  // 获取指定数据块的BlockStatus
   def getStatus(blockId: BlockId): Option[BlockStatus] = Option(_blocks.get(blockId))
 
   def updateLastSeenMs(): Unit = {
     _lastSeenMs = System.currentTimeMillis()
   }
 
+  // master接收到更新消息后进行更新
   def updateBlockInfo(
       blockId: BlockId,
       storageLevel: StorageLevel,
@@ -727,16 +787,24 @@ private[spark] class BlockManagerInfo(
 
     if (blockExists) {
       // The block exists on the storage endpoint already.
+      // 获取数据块对应的BlockStatus
       val blockStatus: BlockStatus = _blocks.get(blockId)
+      // 记录旧的值
       originalLevel = blockStatus.storageLevel
       originalMemSize = blockStatus.memSize
       originalDiskSize = blockStatus.diskSize
 
       if (originalLevel.useMemory) {
+        /**
+         * 因为原来的存储级别使用的内存，现在要对其进行修改，
+         * 则先将旧的内存值累加到_remainingMem中，说明将该数据块原来使用的内存大小归还了，
+         * 在后面的操作还会将新的内存值从_remainingMem中减去，说明又将特定的内存大小分配给该数据块了。
+         */
         _remainingMem += originalMemSize
       }
     }
 
+    // 检查设置的存储级别是否有效，即数据块使用了内存或磁盘存储级别，且副本数量大于1
     if (storageLevel.isValid) {
       /* isValid means it is either stored in-memory or on-disk.
        * The memSize here indicates the data size in or dropped from memory,
@@ -745,10 +813,12 @@ private[spark] class BlockManagerInfo(
        * They can be both larger than 0, when a block is dropped from memory to disk.
        * Therefore, a safe way to set BlockStatus is to set its info in accurate modes. */
       var blockStatus: BlockStatus = null
-      if (storageLevel.useMemory) {
+      // 为什么内存和存储只会使用一个？？？
+      if (storageLevel.useMemory) {  // 使用内存存储级别
+        // 构建新的BlockStatus对象，磁盘存储为0
         blockStatus = BlockStatus(storageLevel, memSize = memSize, diskSize = 0)
-        _blocks.put(blockId, blockStatus)
-        _remainingMem -= memSize
+        _blocks.put(blockId, blockStatus) // 更新字典
+        _remainingMem -= memSize  // 将特定的内存大小分配给该数据块了，所以需要从总的剩余内存中减去
         if (blockExists) {
           logInfo(s"Updated $blockId in memory on ${blockManagerId.hostPort}" +
             s" (current size: ${Utils.bytesToString(memSize)}," +
@@ -760,9 +830,10 @@ private[spark] class BlockManagerInfo(
             s" free: ${Utils.bytesToString(_remainingMem)})")
         }
       }
-      if (storageLevel.useDisk) {
+      if (storageLevel.useDisk) { // 使用磁盘存储级别
+        // 构建新的BlockStatus对象，内存存储为0
         blockStatus = BlockStatus(storageLevel, memSize = 0, diskSize = diskSize)
-        _blocks.put(blockId, blockStatus)
+        _blocks.put(blockId, blockStatus)  // 更新_blocks字典
         if (blockExists) {
           logInfo(s"Updated $blockId on disk on ${blockManagerId.hostPort}" +
             s" (current size: ${Utils.bytesToString(diskSize)}," +
@@ -778,9 +849,9 @@ private[spark] class BlockManagerInfo(
           shuffleServiceBlocks.put(blockId, blockStatus)
         }
       }
-    } else if (blockExists) {
+    } else if (blockExists) {  // 存储级别无效，检查当前BlockManager是否管理该数据块
       // If isValid is not true, drop the block.
-      _blocks.remove(blockId)
+      _blocks.remove(blockId)  // 从_blocks中移除
       externalShuffleServiceBlockStatus.foreach { blockStatus =>
         blockStatus.remove(blockId)
       }
@@ -796,20 +867,25 @@ private[spark] class BlockManagerInfo(
     }
   }
 
+  // 移除指定数据块
   def removeBlock(blockId: BlockId): Unit = {
     if (_blocks.containsKey(blockId)) {
+      // 归还数据块占用的内存给_remainingMem
       _remainingMem += _blocks.get(blockId).memSize
-      _blocks.remove(blockId)
+      _blocks.remove(blockId)  // 从_blocks中移除
       externalShuffleServiceBlockStatus.foreach { blockStatus =>
         blockStatus.remove(blockId)
       }
     }
   }
 
+  // 获取当前BlockManagerInfo对应的BlockManager管理的内存剩余的总大小
   def remainingMem: Long = _remainingMem
 
+  // 获取当前BlockManagerinfo最后被访问的事件
   def lastSeenMs: Long = _lastSeenMs
 
+  // 获取_block
   def blocks: JHashMap[BlockId, BlockStatus] = _blocks
 
   override def toString: String = "BlockManagerInfo " + timeMs + " " + _remainingMem
